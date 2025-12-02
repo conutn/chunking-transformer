@@ -1,9 +1,8 @@
 import torch
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
+import math
 import torch.nn.functional as F
-import random
-import time
+from torch.utils.data import Dataset, DataLoader
 
 class BatchedAttentionLayer(nn.Module):
     def __init__(self, d_model, d_ffn, nhead, dropout = 0.0, bias = True):
@@ -31,22 +30,21 @@ class BatchedAttentionLayer(nn.Module):
         H = self.nhead
         dH = self.d_head
         
-        # project Q, K, V
-        q = self.W_q(x).view(B, T, H, dH).transpose(1, 2)  # (B, H, T, dH)
+        q = self.W_q(x).view(B, T, H, dH).transpose(1, 2)
         k = self.W_k(x).view(B, T, H, dH).transpose(1, 2)
         v = self.W_v(x).view(B, T, H, dH).transpose(1, 2)
         
-        attn_logits = torch.matmul(q, k.transpose(2, 3)) / (dH ** 0.5)  # (B, H, T, T)
+        attn_logits = torch.matmul(q, k.transpose(2, 3)) / (dH ** 0.5)
         
         if mask is not None:
-            if mask.dtype != torch.bool:
-                mask = torch.log(mask + 1e-9)
+            #if mask.dtype != torch.bool:
+            #    mask = torch.log(mask + 1e-9)
             attn_logits = attn_logits + mask.unsqueeze(1)
         
         attn = F.softmax(attn_logits, dim = -1)
         attn = self.dropout(attn)
         
-        attn = torch.matmul(attn, v)  # (B, H, T, dH)
+        attn = torch.matmul(attn, v)
         attn = attn.transpose(1, 2).contiguous().view(B, T, D)
 
         x = x + attn
@@ -88,7 +86,6 @@ class BatchedAttention(nn.Module): # use cross-entropy loss
             self.layers.append(BatchedAttentionLayer(d_model, d_ffn, nhead, dropout, bias))
         self.unembedding = nn.Linear(d_model, vocab_size, bias = False)
         self.unembedding.weight = self.embedding.weight
-        self.softmax = nn.Softmax(dim = 2)
 
     def forward(self, x, mask = None):
         x = self.embedding(x)
@@ -96,43 +93,48 @@ class BatchedAttention(nn.Module): # use cross-entropy loss
         for layer in self.layers:
             x = layer(x, mask = mask)
         x = self.unembedding(x)
-        x = self.softmax(x)
         return x
 
 class TransformerDataset(Dataset):
     def __init__(self, tokens, vocab_dct):
-        self.vocab = vocab_dct
-        self.ids = [self.vocab[t] for t in tokens]
+        self.vocab_dct = vocab_dct
+        self.ids = torch.tensor([vocab_dct[t] for t in tokens], dtype = torch.long)
         self.length = len(self.ids) - 1
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        seq = torch.full((self.length,), 0, dtype = torch.long)
-        seq[:idx] = torch.tensor(self.ids[:idx], dtype = torch.long)
-        return (seq, torch.tensor(self.ids[idx], dtype = torch.long))
+        seq = self.ids[:idx]
+        target = self.ids[1:idx+1]
+        return seq, target
 
 def collate(batch):
-    seq = torch.stack([item[0] for item in batch])
-    next = torch.stack([item[1] for item in batch])
-    return seq, next
+    sequences = [item[0] for item in batch]
+    targets = [item[1] for item in batch]
+
+    max_len = max(seq.size(0) for seq in sequences)
+    padded = torch.zeros(len(batch), max_len, dtype = torch.long)
+    padded_targets = torch.zeros(len(batch), max_len, dtype = torch.long)
+
+    for i, seq in enumerate(sequences):
+        padded[i, :seq.size(0)] = seq
+    for i, target in enumerate(targets):
+        padded_targets[i, :target.size(0)] = target
+
+    return padded, padded_targets
 
 def build_attention_mask(seq):
     B, T = seq.shape
+    device = seq.device
 
-    pad_mask = (seq == 0)
-    pad_mask = pad_mask[:, None, :].expand(B, T, T)
-
-    causal_mask = torch.triu(torch.ones(T, T, dtype = torch.bool), diagonal = 1)
+    pad_mask = (seq == 0).unsqueeze(1).expand(B, T, T)
+    causal_mask = torch.triu(torch.ones(T, T, dtype = torch.bool, device = device), diagonal = 1)
     causal_mask = causal_mask.unsqueeze(0).expand(B, T, T)
 
     full_mask = pad_mask | causal_mask
-
-    full_mask = full_mask.float()
-    full_mask = full_mask.masked_fill(full_mask.bool(), float('-inf'))
-
-    return full_mask
+    full_mask = full_mask.float().masked_fill(full_mask.bool(), -1e9)
+    return full_mask.to(device)
 
 def chunks(lst, chunk_size):
     for i in range(0, len(lst), chunk_size):
@@ -157,42 +159,64 @@ vocab = read_vocab("vocab.txt")
 vocab_set = set(vocab)
 vocab_dct = get_vocab_dct_encoder(vocab)
 
-model = BatchedAttention(192, 8, 8, 0.1)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = BatchedAttention(192, 8, 24, 0.1).to(device)
+#model.load_state_dict(torch.load("transformer.pth"))
 loss = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr = 5e-4)
+optimizer = torch.optim.Adam(model.parameters(), lr = 1e-4)
 scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma = 0.95)
-
-device = torch.device("cpu")
 
 epochs = 100
 batch_size = 64
-chunk_size = 1024
-corpus = open('Documents/SRP/train/data.txt').read().split()
+chunk_size = 256
+corpus = open("data.txt", encoding = "latin-1").read().split()
+
+scaler = torch.amp.GradScaler("cuda")
 
 for epoch in range(1, epochs + 1):
     total_loss = 0.0
+    local_loss = 0.0
     iters = 0
 
     for chunk in chunks(corpus, chunk_size):
         ds = TransformerDataset(chunk, vocab_dct)
-        
+
         loader = DataLoader(ds, batch_size = batch_size, shuffle = True, collate_fn = collate)
-        
-        for seq, next in loader:            
+
+        for seq, next in loader:
             seq = seq.to(device)
             next = next.to(device)
             mask = build_attention_mask(seq)
-            next = nn.functional.one_hot(next, len(vocab_dct))
-            
-            optimizer.zero_grad()
-            logits = model(seq, mask = mask)
-            output = loss(logits, next)
-            output.backward()
-            optimizer.step()
-            
-            total_loss += output.item()
-            
+
+            optimizer.zero_grad(set_to_none = True)
+
+            with torch.amp.autocast("cuda", dtype = torch.float16):
+              logits = model(seq, mask = mask)
+              loss_val = loss(logits.transpose(1, 2), next)
+
+            scaler.scale(loss_val).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            if torch.isnan(loss_val):
+              print(iters)
+              print(logits)
+              idx = torch.isnan(logits)
+              print(torch.nonzero(idx))
+              print(logits[idx])
+              print(next)
+              print(loss_val)
+              1/0
+
+            total_loss += loss_val.item()
+            local_loss += loss_val.item()
+
             iters += 1
-            if iters % 1000 == 0:
-                avg_loss = total_loss / max(1, iters)
-                print(f"Epoch {epoch}, processed {iters * batch_size} pairs, avg loss {avg_loss:.4f}")
+            if iters % 10 == 0:
+              avg_loss = total_loss / max(1, iters)
+              local_loss /= 10
+              print(f"Epoch {epoch}, processed {iters * batch_size} pairs, avg loss {avg_loss:.4f}, cur loss {local_loss:.4f}")
+              local_loss = 0.0
+            if iters % 100 == 0:
+              torch.save(model.state_dict(), "transformer.pth")
+              print("Saved model state")
