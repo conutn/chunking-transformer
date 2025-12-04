@@ -142,7 +142,7 @@ def collate(batch):
 def build_mask(seq):
     B, T = seq.shape
     device = seq.device
-    causal = torch.triu(torch.ones(T, T, dtype = torch.bool, device = device), diagonal=1)
+    causal = torch.triu(torch.ones(T, T, dtype = torch.bool, device = device), diagonal = 1)
     additive = causal.float().masked_fill(causal, float("-1e9"))
     return additive.unsqueeze(0).expand(B, T, T)
 
@@ -170,7 +170,7 @@ save_every_steps = 1000
 
 device = device
 ds = TransformerDataset(corpus, vocab_dct, block_size)
-loader = DataLoader(ds, batch_size = batch_size, shuffle = True, collate_fn = collate, drop_last = True, num_workers = 2)
+loader = DataLoader(ds, batch_size = batch_size, shuffle = True, collate_fn = collate, drop_last = True)
 
 model = BatchedAttention(d_model, nhead, num_layers, dropout, d_ffn = 768, vocab_size = len(vocab_dct), max_len = 256).to(device)
 
@@ -206,6 +206,9 @@ scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 scaler = torch.amp.GradScaler()
 
+for step in range(start_step):
+    scheduler.step()
+
 iters = start_step
 model.train()
 for epoch in range(1, epochs + 1):
@@ -218,7 +221,7 @@ for epoch in range(1, epochs + 1):
 
         optimizer.zero_grad(set_to_none = True)
 
-        with torch.amp.autocast(device_type = device.type, dtype=torch.float16 if device.type == "cuda" else torch.float32):
+        with torch.amp.autocast(device_type = device.type, dtype = torch.float16 if device.type == "cuda" else torch.float32):
             logits = model(seq, mask = mask)
             B, T, V = logits.shape
             loss_val = loss_f(logits.view(-1, V), target.view(-1))
