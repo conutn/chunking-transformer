@@ -105,6 +105,8 @@ def read_vocab(fname):
             vocab.append("§" + word[2:])
         else:
             vocab.append(word)
+    vocab = list(filter(lambda x: len(x) <= 4 or ('§' in x and len(x) == 5), vocab))
+    vocab += ["[SEP]", "[PAD]", "[UNK]"]
     return vocab
 
 def get_vocab_dct_encoder(vocab):
@@ -155,11 +157,11 @@ embedding_path = "input192.pt"
 checkpoint_path = "transformer.pth"
 d_model = 192
 nhead = 8
-num_layers = 24
+num_layers = 12
 dropout = 0.1
-freeze_embeddings = True
-block_size = 256
-batch_size = 16
+freeze_embeddings = False
+block_size = 128
+batch_size = 32
 epochs = 10
 lr = 3e-4
 warmup_steps = 2000
@@ -198,7 +200,7 @@ optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters
 def lr_lambda(step):
     if step < warmup_steps:
         return float(step + 1) / float(max(1, warmup_steps))
-    return 1.0
+    return (0.99) ** (step // 1000)
 
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
