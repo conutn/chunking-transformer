@@ -29,14 +29,16 @@ class BatchedAttentionLayer(nn.Module):
         H = self.nhead
         dH = self.d_head
 
-        q = self.W_q(x).view(B, T, H, dH).transpose(1, 2)
-        k = self.W_k(x).view(B, T, H, dH).transpose(1, 2)
-        v = self.W_v(x).view(B, T, H, dH).transpose(1, 2)
+        y = self.LayerNorm1(x)
+
+        q = self.W_q(y).view(B, T, H, dH).transpose(1, 2)
+        k = self.W_k(y).view(B, T, H, dH).transpose(1, 2)
+        v = self.W_v(y).view(B, T, H, dH).transpose(1, 2)
 
         attn_logits = torch.matmul(q, k.transpose(2, 3)) / (dH ** 0.5)
 
         if mask is not None:
-            attn_logits = attn_logits + mask.unsqueeze(1)
+            attn_logits = attn_logits + mask
 
         attn = F.softmax(attn_logits, dim = -1)
         attn = self.dropout(attn)
@@ -45,15 +47,15 @@ class BatchedAttentionLayer(nn.Module):
         attn = attn.transpose(1, 2).contiguous().view(B, T, D)
 
         x = x + attn
-        x = self.LayerNorm1(x)
 
-        out = self.W_a(x)
+        y = self.LayerNorm2(x)
+
+        out = self.W_a(y)
         out = self.relu(out)
         out = self.W_b(out)
         out = self.dropout(out)
 
         x = x + out
-        x = self.LayerNorm2(x)
 
         return x
 
@@ -84,9 +86,6 @@ class BatchedAttention(nn.Module):
             self.layers.append(BatchedAttentionLayer(d_model, d_ffn, nhead, dropout, bias))
         self.unembedding = nn.Linear(d_model, vocab_size, bias = False)
         self.unembedding.weight = self.embedding.weight
-
-        self.embedding.no_grad = True
-        self.unembedding.no_grad = True
 
     def forward(self, x, mask = None):
         x = self.embedding(x)
@@ -123,7 +122,8 @@ def load_embedding_matrix(fname, device):
 class TransformerDataset(Dataset):
     def __init__(self, tokens, vocab_dct, block_size = 256):
         self.vocab_dct = vocab_dct
-        ids = [vocab_dct[t] for t in tokens]
+        unk_id = vocab_dct['[UNK]']
+        ids = [vocab_dct.get(t, unk_id) for t in tokens]
         self.ids = torch.tensor(ids, dtype = torch.long)
         self.block_size = block_size
 
@@ -142,9 +142,8 @@ def collate(batch):
 def build_mask(seq):
     B, T = seq.shape
     device = seq.device
-    causal = torch.triu(torch.ones(T, T, dtype = torch.bool, device = device), diagonal = 1)
-    additive = causal.float().masked_fill(causal, float("-1e9"))
-    return additive.unsqueeze(0).expand(B, T, T)
+    mask = torch.triu(torch.full((T, T), float('-inf'), device = device), diagonal = 1)
+    return mask.unsqueeze(0).unsqueeze(0)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -153,17 +152,16 @@ corpus = open("data.txt", encoding="latin-1").read().split()
 vocab = read_vocab("vocab.txt")
 vocab_dct = get_vocab_dct_encoder(vocab)
 
-embedding_path = "input192.pt"
-checkpoint_path = "transformer.pth"
+checkpoint_path = "transformer192.pth"
 d_model = 192
 nhead = 8
 num_layers = 12
 dropout = 0.1
 freeze_embeddings = False
-block_size = 128
-batch_size = 32
-epochs = 10
-lr = 3e-4
+block_size = 256
+batch_size = 16
+epochs = 50
+lr = 1e-4
 warmup_steps = 2000
 max_grad_norm = 1.0
 save_every_steps = 1000
@@ -172,20 +170,7 @@ device = device
 ds = TransformerDataset(corpus, vocab_dct, block_size)
 loader = DataLoader(ds, batch_size = batch_size, shuffle = True, collate_fn = collate, drop_last = True)
 
-model = BatchedAttention(d_model, nhead, num_layers, dropout, d_ffn = 768, vocab_size = len(vocab_dct), max_len = 256).to(device)
-
-if os.path.exists(embedding_path):
-    emb_w = load_embedding_matrix(embedding_path, device)
-    if emb_w.shape != model.embedding.weight.data.shape:
-        print(f"embedding shape mismatch: file {emb_w.shape}, model {model.embedding.weight.data.shape}")
-    else:
-        model.embedding.weight.data.copy_(emb_w)
-        model.unembedding.weight.data.copy_(emb_w)
-
-model.unembedding.weight = model.embedding.weight
-if freeze_embeddings:
-    model.embedding.weight.requires_grad = False
-    model.unembedding.weight.requires_grad = False
+model = BatchedAttention(d_model, nhead, num_layers, dropout, d_ffn = d_model * 4, vocab_size = len(vocab_dct), max_len = 256).to(device)
 
 start_step = 0
 if os.path.exists(checkpoint_path):
@@ -200,7 +185,7 @@ optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters
 def lr_lambda(step):
     if step < warmup_steps:
         return float(step + 1) / float(max(1, warmup_steps))
-    return (0.99) ** (step // 1000)
+    return max(0.01, (0.999) ** (step // 1000)) # Modified decay and added min learning rate
 
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
