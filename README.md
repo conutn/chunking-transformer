@@ -1,12 +1,17 @@
 # chunking-transformer
 
-## HierarchicalTransformer (dynamic chunking) appendix code
+### HierarchicalTransformer (dynamic chunking)
 
 Split into three files so the architecture can be read independently of the training setup.
 
 model.py: chunk_weights, hard_chunk_bounds, gumbel_hard, extract_chunks), BoundaryPredictor, BatchedAttentionLayer, PositionalEncoding, and HierarchicalTransformer.
 data.py: vocab loading, Tokenizer, and ChunkedDataset / get_split / collate for dataset loading
 train.py: boundary loss (BoundaryReinforceLoss), optimizer/scheduler setup, training loop with checkpointing and validation, and a sample_from_model for qualitative generation checks. Run directly with python train.py.
+
+### BatchedAttention (baseline model)
+
+Same setup as HierarchicalTransformer, model.py only includes functions necessary for the standard transformer.
+
 ### Requirements
 
 torch, pynvml (optional GPU telemetry), unidecode.
