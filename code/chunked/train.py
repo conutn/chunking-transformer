@@ -14,7 +14,11 @@ Writes, in the working directory:
     valid.txt     - validation CE loss
 
 The GPU telemetry requires
-pynvml and an NVIDIA GPU; delete if unavailable.
+pynvml and an NVIDIA GPU; delete if unavailable
+
+IMPORTANT:
+Run in a separate directory than the standard version, both use `loss.txt` and `valid.txt`
+for writing.
 """
 
 import math
